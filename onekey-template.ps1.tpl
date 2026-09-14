@@ -92,6 +92,85 @@ function Stop-RunningApp {
     return $true
 }
 
+function Register-Autostart {
+    # 目标：让 campus-auth 在「登录」和「从睡眠/锁屏唤醒解锁」时都能自启。
+    # 纯 Run 键(HKCU\...\Run)只在登录/重启触发，睡眠唤醒不补拉起——这是“自启动不太灵”的根因。
+    # 计划任务同时挂 Logon + SessionUnlock 两个触发器，补齐唤醒缺口；多实例策略 IgnoreNew 防止与 Run 键重复拉起。
+    # 注册计划任务需要管理员权限；若当前无管理员，则回退到仅 Run 键（登录自启，已是 app 自带机制），并提示唤醒自启需手动授权。
+    # 全部按当前账户($env:USERDOMAIN\$env:USERNAME)与真实安装目录($InstallDir)动态生成 -> 随安装器分发、换机即用，不写死任何机器信息。
+    $exePath = Join-Path $InstallDir 'campus-auth.exe'
+    if (-not (Test-Path $exePath)) { return }
+    $taskName = 'Campus-Auth Autostart'
+    $user = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
+
+    # XML 文本转义（路径里若带 & < > 需转义，否则 schtasks 报“意外节点”）
+    $esc = { param($s) $s -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' }
+    $exeEsc = & $esc $exePath
+    $dirEsc = & $esc $InstallDir
+
+    $xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>$user</Author>
+    <Description>Campus-Auth 开机/唤醒自启动（覆盖 Run 键不响应睡眠唤醒的缺口）</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><UserId>$user</UserId><Delay>PT30S</Delay></LogonTrigger>
+    <SessionStateChangeTrigger><UserId>$user</UserId><StateChange>SessionUnlock</StateChange><Delay>PT30S</Delay></SessionStateChangeTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><UserId>$user</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>$exeEsc</Command><WorkingDirectory>$dirEsc</WorkingDirectory></Exec></Actions>
+</Task>
+"@
+
+    $isAdmin = $false
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $isAdmin = ($id.Groups | ForEach-Object { $_.Value }) -contains 'S-1-5-32-544'
+    } catch { $isAdmin = $false }
+
+    $taskOk = $false
+    if ($isAdmin) {
+        $xmlFile = Join-Path $env:TEMP ("campus-auth-task-" + [Guid]::NewGuid().ToString('N') + ".xml")
+        try {
+            $sw = New-Object System.IO.StreamWriter($xmlFile, $false, [Text.Encoding]::Unicode)  # UTF-16LE + BOM，schtasks 兼容
+            $sw.Write($xml); $sw.Close()
+            schtasks /Create /TN "$taskName" /XML "$xmlFile" /F 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { $taskOk = $true; Write-Host ("  [OK] 已注册计划任务「" + $taskName + "」：登录 + 唤醒均自启") }
+            else { Write-Host ("  [!] 计划任务注册失败(返回 " + $LASTEXITCODE + ")，回退 Run 键") }
+        } catch {
+            Write-Host ("  [!] 计划任务注册异常: " + $_.Exception.Message)
+        } finally {
+            Remove-Item $xmlFile -Force -ErrorAction SilentlyContinue
+        }
+    } else {
+        Write-Host "  [i] 当前非管理员，跳过计划任务（唤醒自启需授权）；改用 Run 键保证登录自启"
+    }
+
+    if (-not $taskOk) {
+        # 回退：写 HKCU Run 键（无需管理员，已是 app 自带机制；这里显式兜底确保即便尚未启动过也能登录自启）
+        try {
+            $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+            $cmd = '"{0}"' -f $exePath
+            New-ItemProperty -Path $runKey -Name 'Campus-Auth' -Value $cmd -PropertyType String -Force | Out-Null
+            Write-Host "  [OK] 已写入 Run 键（登录自启；唤醒自启请以管理员身份重跑本安装器）"
+        } catch {
+            Write-Host ("  [!] Run 键写入失败（不影响使用，可在程序设置里开启自启）: " + $_.Exception.Message)
+        }
+    }
+}
+
 function Get-ApiPort {
     # actual port is written by the app into config\.instance (line1=PID, line2=port);
     # only trust it while that PID is alive -> stale files from old runs are ignored
@@ -281,6 +360,10 @@ if (Invoke-Download ($zipUrl + '.sha256') $tmpSha -MinSize 16 -Quiet) {
         Copy-Item $_.FullName (Join-Path $InstallDir $_.Name) -Recurse -Force
     }
     Write-Host ("程序文件已就位: " + $InstallDir)
+
+    # ---- configure autostart (login + wake/unlock coverage, portable) ----
+    Write-Host "配置开机/唤醒自启..."
+    Register-Autostart
 
     # ---- pre-configure (fresh install only) ----
     if (-not $updateMode) {

@@ -2,6 +2,20 @@
 campus-auth-onekey-setup.ps1
 campus-auth-一键安装.bat
 
+# 机器专属遗留文件（写死了本机账户/路径，不可随分发版提交）
+campus-auth-autostart-task.xml
+install_autostart.bat
+
+# 测试 / 调试产物（本地验证用，非项目交付物）
+_test_autostart.ps1
+_dump_xml.ps1
+_syntax_check.txt
+_autotest_result.txt
+_autotest_stderr.txt
+_xml_dump.txt
+_xmlnodes.txt
+_autotest/
+
 # Python
 __pycache__/
 *.pyc
