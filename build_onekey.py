@@ -3,13 +3,12 @@
 import io, os
 
 BASE = os.path.dirname(os.path.abspath(__file__))  # script dir: template + fixed task json + outputs live here
-PROJ = r"D:\桌面\campus-auth-v5.0.0-alpha.10-x86_64-pc-windows-msvc"
 MARK = "#CAMPUSAUTH_PS#"
 
 tpl = io.open(os.path.join(BASE, "onekey-template.ps1.tpl"), encoding="utf-8").read()
 
-preset = os.path.join(BASE, "preset-settings.json")   # captured from user's real config; keeps rebuild independent of the install dir
-settings = io.open(preset if os.path.exists(preset) else os.path.join(PROJ, "config", "settings.json"), encoding="utf-8").read().strip()
+preset = os.path.join(BASE, "preset-settings.json")   # captured from user's real config; single source for rebuild, independent of any install/proj dir
+settings = io.open(preset, encoding="utf-8").read().strip()
 task = io.open(os.path.join(BASE, "campus-auth-default-fixed.json"), encoding="utf-8").read().strip()
 order = '{\n  "order": [\n    "default"\n  ],\n  "active": "default"\n}'
 
