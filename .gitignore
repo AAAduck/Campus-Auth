@@ -1,0 +1,14 @@
+# 构建产物（由 build_onekey.py 重新生成，按需发布）
+campus-auth-onekey-setup.ps1
+campus-auth-一键安装.bat
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
