@@ -30,6 +30,7 @@ io.open(ps1, "w", encoding="utf-8-sig", newline="\r\n").write(body)
 head = (
     "@echo off\r\n"
     "rem campus-auth one-click installer - double click to run (cmd header, PS body below)\r\n"
+    "set \"CA_SELF=%~f0\"\r\n"
     "powershell -NoProfile -ExecutionPolicy Bypass -Command \"iex ([IO.File]::ReadAllText('%~f0',[Text.Encoding]::UTF8) -split ('#' + 'CAMPUSAUTH_PS' + '#'),2)[1]\"\r\n"
     "pause\r\n"
     "exit /b\r\n"

@@ -25,6 +25,35 @@ $API_URL    = 'https://api.github.com/repos/Misyra/Campus-Auth-rs/releases/lates
 $FALLBACK   = 'https://github.com/Misyra/Campus-Auth-rs/releases/latest/download/campus-auth-v5.0.0-alpha.10-x86_64-pc-windows-msvc.zip'
 $CHANNELS   = @('', 'https://gh-proxy.com/')   # direct first, then gh-proxy
 
+# ---- 管理员权限：注册「登录 + 唤醒」自启任务需要管理员 ----
+# 直接双击（非提权）时自动请求 UAC 提权重跑；用户取消则按普通权限继续（仅登录自启）。
+# 静默模式(CA_ASSUMEYES)不弹 UAC，避免打断自动化。
+$IsAdmin = $false
+try {
+    $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { $IsAdmin = $false }
+if ((-not $IsAdmin) -and (-not $AssumeYes)) {
+    $SelfPath = $env:CA_SELF
+    if (-not $SelfPath) { try { $SelfPath = $MyInvocation.MyCommand.Path } catch {} }
+    if ($SelfPath -and (Test-Path $SelfPath)) {
+        Write-Host "本安装器需要管理员权限（用于注册开机/唤醒自启任务）。正在请求提权，请在弹窗中点「是」..."
+        try {
+            if ($SelfPath -match '\.ps1$') {
+                Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $SelfPath + '"'))
+            } else {
+                Start-Process -FilePath $SelfPath -Verb RunAs
+            }
+            Write-Host "已发起提权，安装将在新的管理员窗口中继续；本窗口可关闭。"
+            exit 0
+        } catch {
+            Write-Host ("未获得管理员权限（可能被取消）：" + $_.Exception.Message)
+            Write-Host "将按普通权限继续安装 —— 仅启用登录自启（无唤醒自启）。如需唤醒自启，请右键安装器 -> 以管理员身份运行。"
+        }
+    } else {
+        Write-Host "提示：当前非管理员，仅启用登录自启（无唤醒自启）。如需唤醒自启，请以管理员身份运行本安装器。"
+    }
+}
+
 function Read-Choice([string]$msg) {
     if ($AssumeYes) { return $true }
     $a = Read-Host "$msg [Y/N]"
@@ -146,9 +175,18 @@ function Register-Autostart {
         try {
             $sw = New-Object System.IO.StreamWriter($xmlFile, $false, [Text.Encoding]::Unicode)  # UTF-16LE + BOM，schtasks 兼容
             $sw.Write($xml); $sw.Close()
-            schtasks /Create /TN "$taskName" /XML "$xmlFile" /F 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) { $taskOk = $true; Write-Host ("  [OK] 已注册计划任务「" + $taskName + "」：登录 + 唤醒均自启") }
-            else { Write-Host ("  [!] 计划任务注册失败(返回 " + $LASTEXITCODE + ")，回退 Run 键") }
+            # 局部降级 ErrorActionPreference：native 命令写 stderr 时，全局 Stop 会将其当终止错误抛出，
+            # 导致「其实注册成功却被误判失败」。改为 Continue + 显式读退出码。
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            $schOut = schtasks /Create /TN "$taskName" /XML "$xmlFile" /F 2>&1
+            $rc = $LASTEXITCODE
+            $ErrorActionPreference = $prevEap
+            if ($rc -eq 0) { $taskOk = $true; Write-Host ("  [OK] 已注册计划任务「" + $taskName + "」：登录 + 唤醒均自启") }
+            else {
+                Write-Host ("  [!] 计划任务注册失败(返回 " + $rc + ")，回退 Run 键")
+                if ($schOut) { Write-Host ("      " + (($schOut | Out-String).Trim())) }
+            }
         } catch {
             Write-Host ("  [!] 计划任务注册异常: " + $_.Exception.Message)
         } finally {
@@ -310,7 +348,11 @@ if (-not $updateMode) {
     }
     if (-not $Password) {
         while ($true) {
-            $Password = Read-Host "请输入校园网密码"
+            # 不回显：避免同学在教室/宿舍当众安装时密码直接显示在屏幕上
+            $sec = Read-Host "请输入校园网密码（输入时不显示，输完回车）" -AsSecureString
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+            try { $Password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
             if ($Password) { break }
             Write-Host "密码不能为空，请重新输入。"
         }
@@ -338,11 +380,19 @@ if (-not (Invoke-Download $zipUrl $tmpZip)) {
     Write-Host ("  " + $zipUrl)
     exit 1
 }
-if (Invoke-Download ($zipUrl + '.sha256') $tmpSha -MinSize 16 -Quiet) {
+    if (Invoke-Download ($zipUrl + '.sha256') $tmpSha -MinSize 16 -Quiet) {
         $expect = ((Get-Content $tmpSha -TotalCount 1) -split '\s+')[0].Trim().ToLower()
-        $actual = (Get-FileHash $tmpZip -Algorithm SHA256).Hash.ToLower()
-        if ($expect -ne $actual) { Write-Host "SHA256 校验失败，安装中止。"; exit 1 }
-        Write-Host "SHA256 校验通过"
+        # 上游若未附 .sha256，或镜像返回的是错误页，拿到的都不是 64 位十六进制：
+        # 此时「跳过校验」而非「中止安装」，避免上游打包问题挡住正常安装（用户曾遇此坑）
+        if ($expect -match '^[0-9a-f]{64}$') {
+            $actual = (Get-FileHash $tmpZip -Algorithm SHA256).Hash.ToLower()
+            if ($expect -ne $actual) { Write-Host "SHA256 校验失败（下载文件与官方校验值不符），安装中止。"; exit 1 }
+            Write-Host "SHA256 校验通过"
+        } else {
+            Write-Host "未取得有效 SHA256 校验值，跳过校验（不影响安装）"
+        }
+    } else {
+        Write-Host "该版本未附带 SHA256 校验文件，跳过校验（不影响安装）"
     }
 
     # ---- extract (handle top-level dir) ----
