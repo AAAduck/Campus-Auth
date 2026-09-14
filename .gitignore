@@ -6,15 +6,8 @@ campus-auth-一键安装.bat
 campus-auth-autostart-task.xml
 install_autostart.bat
 
-# 测试 / 调试产物（本地验证用，非项目交付物）
-_test_autostart.ps1
-_dump_xml.ps1
-_syntax_check.txt
-_autotest_result.txt
-_autotest_stderr.txt
-_xml_dump.txt
-_xmlnodes.txt
-_autotest/
+# 测试 / 调试产物（约定：本地验证文件统一以 _ 前缀命名，全部忽略）
+_*
 
 # Python
 __pycache__/
