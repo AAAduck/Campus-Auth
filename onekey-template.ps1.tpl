@@ -43,7 +43,8 @@ if ($env:CA_SELF) {
     } catch {}
 }
 if ($LogMirror -and ($LogMirror -ieq $LogFile)) { $LogMirror = $null }
-$UnderBat = [bool]($env:CA_SELF -and ($env:CA_SELF -match '(?i)\.bat$'))   # .bat 头自带 pause，无需再等一次
+# .bat 头自带 pause，无需再等一次；但提权窗口是 powershell 直启（没有 .bat 的 pause），必须自己留住窗口
+$UnderBat = [bool]($env:CA_SELF -and ($env:CA_SELF -match '(?i)\.bat$') -and (-not $env:CA_ELEV_CHILD))
 function Write-Log([string]$msg) {
     $line = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $msg
     foreach ($f in @($LogFile, $LogMirror)) {
@@ -69,6 +70,19 @@ Write-Log ("系统=" + [Environment]::OSVersion.VersionString + "  64位进程="
 Write-Log ("用户=" + $env:USERDOMAIN + "\" + $env:USERNAME + "  管理员=" + $IsAdmin + "  已尝试提权=" + [bool]$env:CA_ELEV_TRIED)
 Write-Log ("自身=" + $env:CA_SELF + "  脚本=" + $MyInvocation.MyCommand.Path + "  TEMP=" + $env:TEMP)
 Write-Log ("日志=" + $LogFile + "  镜像=" + $LogMirror)
+# 权限环境快照：判断"提权到底有没有可能成功"（不是管理员账户 / UAC 被关 / 被策略禁止提权）
+try {
+    $inAdminGrp = $false
+    try {
+        $inAdminGrp = [bool]([Security.Principal.WindowsIdentity]::GetCurrent().Groups | Where-Object { $_.Value -eq 'S-1-5-32-544' })
+    } catch {}
+    $uacInfo = 'uac=读取失败'
+    try {
+        $pk = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction Stop
+        $uacInfo = 'EnableLUA=' + $pk.EnableLUA + ' ConsentPromptBehaviorAdmin=' + $pk.ConsentPromptBehaviorAdmin + ' PromptOnSecureDesktop=' + $pk.PromptOnSecureDesktop
+    } catch {}
+    Write-Log ('权限环境: 属管理员组(SID544)=' + $inAdminGrp + '  ' + $uacInfo + '  ComSpec=' + $env:ComSpec + '  提权子进程=' + [bool]$env:CA_ELEV_CHILD)
+} catch {}
 try { Start-Transcript -Path (Join-Path $env:TEMP 'campus-auth-install-transcript.log') -Append -ErrorAction Stop | Out-Null; Write-Log 'transcript=on' } catch { Write-Log ('transcript=off: ' + $_.Exception.Message) }
 Write-Host ("诊断日志: " + $LogFile)
 
@@ -88,8 +102,18 @@ if ((-not $IsAdmin) -and (-not $AssumeYes) -and (-not $env:CA_ELEV_TRIED)) {
             if ($SelfPath -match '\.ps1$') {
                 $child = Start-Process powershell -Verb RunAs -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $SelfPath + '"'))
             } else {
-                # 用 cmd /c 显式启动：不依赖 .bat 文件关联，路径含括号/中文也不会静默失败
-                $child = Start-Process -FilePath $env:ComSpec -Verb RunAs -PassThru -ArgumentList @('/c', ('"' + $SelfPath + '"'))
+                # 提权重跑：用 -EncodedCommand 传一段 Base64 引导码，命令行里只有纯 ASCII。
+                # 早前用 cmd /c "路径" 的写法，在部分机器上管理员窗口会秒退（退出码 1）且原因被 cmd 吞掉：
+                # 路径里的中文/括号要过 cmd 的代码页与语法解析，任一不匹配就失败。
+                # 现在直接让提权后的 PowerShell 重新读本文件执行，绕开 cmd 与路径编码。
+                $q  = [char]39   # 单引号
+                $boot = '$env:CA_ELEV_CHILD=' + $q + '1' + $q + '; $env:CA_ELEV_TRIED=' + $q + '1' + $q +
+                        '; $env:CA_SELF=' + $q + $SelfPath + $q +
+                        '; iex ([IO.File]::ReadAllText(' + $q + $SelfPath + $q + ',[Text.Encoding]::UTF8) -split (' + $q + '#' + $q + '+' + $q + 'CAMPUSAUTH_PS' + $q + '+' + $q + '#' + $q + '),2)[1]'
+                $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($boot))
+                $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                Write-Log ("提权引导码长度=" + $boot.Length)
+                $child = Start-Process -FilePath $psExe -Verb RunAs -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand',$enc)
             }
         } catch {
             Write-Log ("提权失败: " + $_.Exception.Message)
@@ -117,8 +141,14 @@ if ((-not $IsAdmin) -and (-not $AssumeYes) -and (-not $env:CA_ELEV_TRIED)) {
             $rc2 = 'unknown'
             try { $rc2 = $child.ExitCode } catch {}
             Write-Log ("管理员窗口启动后 2.5 秒内即退出（退出码 " + $rc2 + "），判定提权未生效，改为当前窗口继续安装")
-            Write-Host ("管理员窗口没能正常启动（退出码 " + $rc2 + "），改为在当前窗口继续安装（仅登录自启）。")
-            Write-Host "如需唤醒自启，请右键安装器 -> 以管理员身份运行。"
+            Write-Host ""
+            Write-Host ("管理员窗口没能跑起来（退出码 " + $rc2 + "），改为在当前窗口继续安装。")
+            Write-Host "两种常见原因："
+            Write-Host "  1) UAC 弹窗上点了「否」或没点 —— 重新双击本安装器，弹窗出来时点「是」；"
+            Write-Host "  2) 这个 Windows 账户不在管理员组，或 UAC 被策略关闭 —— 提权不可能成功，"
+            Write-Host "     请换管理员账户登录后再运行（或右键本安装器 -> 以管理员身份运行）。"
+            Write-Host "影响：仅少了「睡眠唤醒后自动重连」，登录自启照常可用。"
+            Write-Host ("诊断日志: " + $LogFile)
         }
     } else {
         Write-Host "提示：当前非管理员，仅启用登录自启（无唤醒自启）。如需唤醒自启，请以管理员身份运行本安装器。"
