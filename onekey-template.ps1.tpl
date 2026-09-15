@@ -25,41 +25,31 @@ $API_URL    = 'https://api.github.com/repos/Misyra/Campus-Auth-rs/releases/lates
 $FALLBACK   = 'https://github.com/Misyra/Campus-Auth-rs/releases/latest/download/campus-auth-v5.0.0-alpha.10-x86_64-pc-windows-msvc.zip'
 $CHANNELS   = @('', 'https://gh-proxy.com/')   # direct first, then gh-proxy
 
-# ---- 管理员权限：注册「登录 + 唤醒」自启任务需要管理员 ----
-# 直接双击（非提权）时自动请求 UAC 提权重跑；用户取消则按普通权限继续（仅登录自启）。
-# 静默模式(CA_ASSUMEYES)不弹 UAC，避免打断自动化。
+# ---- 是否已在管理员上下文（提权动作放到下面日志就绪之后，确保任何提前退出都留证据）----
 $IsAdmin = $false
 try {
     $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 } catch { $IsAdmin = $false }
-if ((-not $IsAdmin) -and (-not $AssumeYes) -and (-not $env:CA_ELEV_TRIED)) {
-    $SelfPath = $env:CA_SELF
-    if (-not $SelfPath) { try { $SelfPath = $MyInvocation.MyCommand.Path } catch {} }
-    if ($SelfPath -and (Test-Path $SelfPath)) {
-        Write-Host "本安装器需要管理员权限（用于注册开机/唤醒自启任务）。正在请求提权，请在弹窗中点「是」..."
-        try {
-            $env:CA_ELEV_TRIED = '1'   # 只提权一次，避免提权后仍非管理员时无限弹窗刷屏
-            if ($SelfPath -match '\.ps1$') {
-                Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $SelfPath + '"'))
-            } else {
-                Start-Process -FilePath $SelfPath -Verb RunAs
-            }
-            Write-Host "已发起提权，安装将在新的管理员窗口中继续；本窗口可关闭。"
-            exit 0
-        } catch {
-            Write-Host ("未获得管理员权限（可能被取消）：" + $_.Exception.Message)
-            Write-Host "将按普通权限继续安装 —— 仅启用登录自启（无唤醒自启）。如需唤醒自启，请右键安装器 -> 以管理员身份运行。"
-        }
-    } else {
-        Write-Host "提示：当前非管理员，仅启用登录自启（无唤醒自启）。如需唤醒自启，请以管理员身份运行本安装器。"
-    }
-}
 
 # ---------------- 诊断日志：窗口一闪而过 / 报错时，把下面这个文件发回来即可定位 ----------------
+# 必须在任何 exit 之前初始化：早前版本把日志建在提权块之后，导致提权交接一出问题就零证据。
+# 双写：%TEMP% 一份；安装器同目录再镜像一份（提权后若换了账户，TEMP 会变，靠镜像兜底）。
 $LogFile  = Join-Path $env:TEMP 'campus-auth-install.log'
+$LogMirror = $null
+if ($env:CA_SELF) {
+    try {
+        $sd = Split-Path -Parent $env:CA_SELF
+        if ($sd -and (Test-Path $sd)) { $LogMirror = Join-Path $sd 'campus-auth-install.log' }
+    } catch {}
+}
+if ($LogMirror -and ($LogMirror -ieq $LogFile)) { $LogMirror = $null }
 $UnderBat = [bool]($env:CA_SELF -and ($env:CA_SELF -match '(?i)\.bat$'))   # .bat 头自带 pause，无需再等一次
 function Write-Log([string]$msg) {
-    try { Add-Content -LiteralPath $LogFile -Value ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $msg) -Encoding UTF8 } catch {}
+    $line = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $msg
+    foreach ($f in @($LogFile, $LogMirror)) {
+        if (-not $f) { continue }
+        try { Add-Content -LiteralPath $f -Value $line -Encoding UTF8 } catch {}
+    }
 }
 function Wait-ExitKey([string]$tip) {
     if ($AssumeYes -or $UnderBat) { return }
@@ -76,10 +66,65 @@ function Die([string]$msg) {
 Write-Log "================ 安装器启动 ================"
 Write-Log ("时间=" + (Get-Date).ToString('s') + "  PS=" + $PSVersionTable.PSVersion.ToString() + "  语言模式=" + $ExecutionContext.SessionState.LanguageMode)
 Write-Log ("系统=" + [Environment]::OSVersion.VersionString + "  64位进程=" + [Environment]::Is64BitProcess)
-Write-Log ("用户=" + $env:USERDOMAIN + "\" + $env:USERNAME + "  管理员=" + $IsAdmin)
+Write-Log ("用户=" + $env:USERDOMAIN + "\" + $env:USERNAME + "  管理员=" + $IsAdmin + "  已尝试提权=" + [bool]$env:CA_ELEV_TRIED)
 Write-Log ("自身=" + $env:CA_SELF + "  脚本=" + $MyInvocation.MyCommand.Path + "  TEMP=" + $env:TEMP)
+Write-Log ("日志=" + $LogFile + "  镜像=" + $LogMirror)
 try { Start-Transcript -Path (Join-Path $env:TEMP 'campus-auth-install-transcript.log') -Append -ErrorAction Stop | Out-Null; Write-Log 'transcript=on' } catch { Write-Log ('transcript=off: ' + $_.Exception.Message) }
 Write-Host ("诊断日志: " + $LogFile)
+
+# ---- 管理员权限：注册「登录 + 唤醒」自启任务需要管理员 ----
+# 直接双击（非提权）时自动请求 UAC 提权重跑；用户取消/失败则按普通权限继续（仅登录自启）。
+# 静默模式(CA_ASSUMEYES)不弹 UAC，避免打断自动化。
+# 提权只试一次（CA_ELEV_TRIED），避免提权后仍非管理员时无限弹窗。
+if ((-not $IsAdmin) -and (-not $AssumeYes) -and (-not $env:CA_ELEV_TRIED)) {
+    $SelfPath = $env:CA_SELF
+    if (-not $SelfPath) { try { $SelfPath = $MyInvocation.MyCommand.Path } catch {} }
+    Write-Log ("提权目标=" + $SelfPath)
+    if ($SelfPath -and (Test-Path $SelfPath)) {
+        Write-Host "本安装器需要管理员权限（用于注册开机/唤醒自启任务）。正在请求提权，请在弹窗中点「是」..."
+        $env:CA_ELEV_TRIED = '1'
+        $child = $null
+        try {
+            if ($SelfPath -match '\.ps1$') {
+                $child = Start-Process powershell -Verb RunAs -PassThru -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $SelfPath + '"'))
+            } else {
+                # 用 cmd /c 显式启动：不依赖 .bat 文件关联，路径含括号/中文也不会静默失败
+                $child = Start-Process -FilePath $env:ComSpec -Verb RunAs -PassThru -ArgumentList @('/c', ('"' + $SelfPath + '"'))
+            }
+        } catch {
+            Write-Log ("提权失败: " + $_.Exception.Message)
+            Write-Host ("未获得管理员权限（可能被取消）：" + $_.Exception.Message)
+            Write-Host "将按普通权限继续安装 —— 仅启用登录自启（无唤醒自启）。如需唤醒自启，请右键安装器 -> 以管理员身份运行。"
+        }
+        if ($child) {
+            # 等管理员窗口跑完再退出：否则本窗口一闪而过，用户会以为"闪退"且拿不到任何结果
+            Write-Log ("已发起提权 PID=" + $child.Id + "，本进程等待管理员窗口结束")
+            Write-Host ("已请求管理员权限（管理员窗口 PID " + $child.Id + "）。本窗口会等它跑完再关闭，请在管理员窗口里继续操作。")
+            Start-Sleep -Milliseconds 2500
+            $alive = $true
+            try { $alive = -not $child.HasExited } catch {}
+            if ($alive) {
+                try { $child.WaitForExit() } catch { Write-Log ("等待子进程异常: " + $_.Exception.Message) }
+                $rc = 'unknown'
+                try { $rc = $child.ExitCode } catch {}
+                Write-Log ("管理员窗口已结束 退出码=" + $rc)
+                Write-Host ("管理员窗口已结束（退出码 " + $rc + "）。诊断日志: " + $LogFile)
+                Wait-ExitKey '提权安装结束'
+                exit 0
+            }
+            # 管理员窗口秒退 = 提权没接上（早期"窗口一闪而过"就是这么来的）。
+            # 不让本窗口跟着闪退：改为当前窗口继续安装，降级为仅登录自启。
+            $rc2 = 'unknown'
+            try { $rc2 = $child.ExitCode } catch {}
+            Write-Log ("管理员窗口启动后 2.5 秒内即退出（退出码 " + $rc2 + "），判定提权未生效，改为当前窗口继续安装")
+            Write-Host ("管理员窗口没能正常启动（退出码 " + $rc2 + "），改为在当前窗口继续安装（仅登录自启）。")
+            Write-Host "如需唤醒自启，请右键安装器 -> 以管理员身份运行。"
+        }
+    } else {
+        Write-Host "提示：当前非管理员，仅启用登录自启（无唤醒自启）。如需唤醒自启，请以管理员身份运行本安装器。"
+        Write-Log "未取到自身路径，跳过提权，按普通权限继续"
+    }
+}
 
 function Read-Choice([string]$msg) {
     if ($AssumeYes) { return $true }
