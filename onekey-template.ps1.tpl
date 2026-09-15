@@ -733,6 +733,58 @@ try {
         } catch {
             Write-Host ("  预置 uv 跳过（不影响安装）: " + $_.Exception.Message)
         }
+        # ---- 预置 CPython 3.12 ----
+        # Worker 工程的 pyproject 要求 python >=3.12,<3.13；机器上没有 3.12 时，
+        # uv sync 会去 github.com 拉 managed CPython（受限/校园网络下常被阻断）→ venv 建不起来 → 后端报
+        # "Worker import 探针失败（退出码 1）: No module named 'playwright'"。
+        # 这里先用国内镜像把 3.12 装好，后端 uv sync 直接复用，不再联网下载解释器。
+        try {
+            if (Test-Path $uvExe) {
+                Write-Host "预置 Python 3.12 解释器（Worker 依赖要求 3.12；避免后端从 github 下载失败）..."
+                $pyMirror = 'https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone/'
+                $pyOk = $false
+                foreach ($mm in @($pyMirror, '')) {
+                    if ($mm) {
+                        $env:UV_PYTHON_INSTALL_MIRROR = $mm
+                        Write-Host "  解释器通道: 国内镜像 (mirror.nju.edu.cn)"
+                    } else {
+                        Remove-Item Env:UV_PYTHON_INSTALL_MIRROR -ErrorAction SilentlyContinue
+                        Write-Host "  解释器通道: 官方源（github.com）"
+                    }
+                    try {
+                        $pp = Start-Process -FilePath $uvExe -ArgumentList @('python', 'install', '3.12') -PassThru -WindowStyle Hidden
+                        $pySw = [System.Diagnostics.Stopwatch]::StartNew()
+                        while ((-not $pp.HasExited) -and ($pySw.Elapsed.TotalSeconds -lt 240)) {
+                            Write-Host -NoNewline ("    已等待 " + [int]$pySw.Elapsed.TotalSeconds + " 秒 ...  `r")
+                            Start-Sleep -Seconds 2
+                        }
+                        Write-Host ""
+                        if (-not $pp.HasExited) {
+                            try { $pp.Kill() } catch {}
+                            Write-Host "    该通道超时（4 分钟），换下一个。"
+                            Write-Log ("python 3.12 预置超时 mirror=" + $mm)
+                        } elseif ($pp.ExitCode -eq 0) {
+                            $pyOk = $true
+                            break
+                        } else {
+                            Write-Host ("    该通道失败（退出码 " + $pp.ExitCode + "），换下一个。")
+                            Write-Log ("python 3.12 预置失败 exit=" + $pp.ExitCode)
+                        }
+                    } catch {
+                        Write-Host ("    通道异常: " + $_.Exception.Message)
+                    }
+                }
+                Remove-Item Env:UV_PYTHON_INSTALL_MIRROR -ErrorAction SilentlyContinue
+                if ($pyOk) {
+                    Write-Host "  Python 3.12 预置成功（后端 uv sync 直接复用，不再联网下载解释器）。"
+                    Write-Log "python 3.12 预置成功"
+                } else {
+                    Write-Host "  Python 3.12 预置未成功（不影响安装），后端会自行尝试下载。"
+                }
+            }
+        } catch {
+            Write-Host ("  预置 Python 解释器跳过（不影响安装）: " + $_.Exception.Message)
+        }
         $launched = $false
         try {
             # 经系统 WMI 服务代为拉起进程：后端父进程是系统服务、无控制台、与任何命令行窗口零关联，
