@@ -28,6 +28,18 @@ powershell -ExecutionPolicy Bypass -File campus-auth-onekey-setup.ps1
 
 ---
 
+## 下载慢 / 卡住怎么办
+
+安装器会**自动依次尝试多个通道**，主程序与 uv 都是如此：
+
+1. GitHub API 直下（`api.github.com` 的资产端点，校园网下通常最通）
+2. github.com 直连
+3. 加速镜像（`gh-proxy.com`、`ghfast.top`）
+
+每个通道下载时都会实时刷新 `已下载 x/y MB (百分比)  速度 MB/s  已用秒数`；**秒数在走就是在下**。若某通道连续 60 秒没有新数据，会自动换下一个通道并打印原因，不会无限卡死。
+
+---
+
 ## 自启动（安装器自动配好，不用管）
 
 | 场景 | 是否自动启动 |
@@ -58,7 +70,7 @@ python build_onekey.py
 | 文件 | 作用 |
 | --- | --- |
 | `build_onekey.py` | 构建脚本：模板 + 预设配置 → 独立安装器 |
-| `onekey-template.ps1.tpl` | 安装器模板：解析最新 Release（含 gh-proxy 加速回退）、下载解压、写配置、启动托盘 |
+| `onekey-template.ps1.tpl` | 安装器模板：解析最新 Release、多通道下载（API 直下 / 直连 / gh-proxy 镜像，带进度与停滞换源）、下载 uv 预置、写配置、注册自启动、启动托盘 |
 | `preset-settings.json` | 真实运行的设置快照，让重建不依赖已安装目录 |
 | `campus-auth-default-fixed.json` | 默认认证任务，账号/密码用 `{{USERNAME}}`/`{{PASSWORD}}` 占位符 |
 
@@ -73,7 +85,7 @@ python build_onekey.py
 - `$AUTH_URL` — 认证页面地址（默认 `http://211.69.15.10:6060/portalReceiveAction.do`）
 - `$ISP` — 运营商选项（默认 `本地账号`）
 - `$API_URL` / `$FALLBACK` — 上游 Release 地址与固定版本回退链接
-- `$CHANNELS` — 下载通道，直连优先、其次 `gh-proxy.com` 加速
+- `$CHANNELS` / `$uvChans` — 下载通道优先级：API 直下 → 直连 → 加速镜像（模板里按此顺序自动组装）
 
 ---
 

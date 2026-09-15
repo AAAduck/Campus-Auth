@@ -102,7 +102,7 @@ function Invoke-Download([string]$url, [string]$outFile, [long]$MinSize = 1MB, [
     return $false
 }
 
-function Save-UrlWithProgress([string]$url, [string]$outFile, [string]$label, [int]$StallSec = 60) {
+function Save-UrlWithProgress([string]$url, [string]$outFile, [string]$label, [int]$StallSec = 60, [hashtable]$Headers) {
     # 单 URL 下载 + 实时进度条（MB / 百分比 / 速度 / 秒数）。
     # 目的：uv 等组件下载时长时间无输出会让人以为卡死；这里每秒跳动一次给人确定感。
     # 停滞 StallSec 秒仍无新字节 -> 判该源失败，交给上层换源。
@@ -111,10 +111,21 @@ function Save-UrlWithProgress([string]$url, [string]$outFile, [string]$label, [i
         $hr = [Net.HttpWebRequest]::Create($url)
         $hr.Method = 'HEAD'; $hr.Timeout = 15000
         $hr.UserAgent = 'campus-auth-installer/1.0'
+        # Accept 属受限标头，必须用属性赋值；其余走 Headers 集合
+        if ($Headers) {
+            foreach ($k in $Headers.Keys) {
+                if ($k -ieq 'Accept') { $hr.Accept = [string]$Headers[$k] } else { $hr.Headers[$k] = [string]$Headers[$k] }
+            }
+        }
         $resp = $hr.GetResponse(); $total = $resp.ContentLength; $resp.Close()
     } catch { $total = 0 }
     $wc = New-Object System.Net.WebClient
     $wc.Headers.Add('User-Agent', 'campus-auth-installer/1.0')
+    if ($Headers) {
+        foreach ($k in $Headers.Keys) {
+            try { $wc.Headers.Add($k, [string]$Headers[$k]) } catch { $wc.Headers[$k] = [string]$Headers[$k] }
+        }
+    }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $task = $wc.DownloadFileTaskAsync($url, $outFile)
     [long]$lastSize = 0; $lastGrow = 0.0
@@ -413,20 +424,51 @@ $tmpSha  = $tmpZip + ".sha256"
 $tmpDir  = Join-Path $env:TEMP ("campus-auth-extract-" + [Guid]::NewGuid().ToString('N'))
 try {
     # resolve latest version dynamically; pinned URL as fallback
-    $zipUrl = $FALLBACK; $verLabel = 'v5.0.0-alpha.10'
+    $zipUrl = $FALLBACK; $verLabel = 'v5.0.0-alpha.10'; $zipAssetId = 0; $shaAssetId = 0
     try {
         Write-Host "查询最新版本..."
         $rel = Invoke-RestMethod -Uri $API_URL -TimeoutSec 20 -UseBasicParsing
         $a = $rel.assets | Where-Object { $_.name -match 'x86_64-pc-windows-msvc\.zip$' } | Select-Object -First 1
-        if ($a) { $zipUrl = $a.browser_download_url; $verLabel = $rel.tag_name; Write-Host ("  最新版: " + $verLabel) }
+        if ($a) { $zipUrl = $a.browser_download_url; $zipAssetId = $a.id; $verLabel = $rel.tag_name; Write-Host ("  最新版: " + $verLabel) }
+        $s = $rel.assets | Where-Object { $_.name -match 'x86_64-pc-windows-msvc\.zip\.sha256$' } | Select-Object -First 1
+        if ($s) { $shaAssetId = $s.id }
     } catch { Write-Host "  查询失败，使用内置链接兜底。" }
     Write-Host ("准备下载: campus-auth " + $verLabel + " (Windows x64)")
-if (-not (Invoke-Download $zipUrl $tmpZip)) {
-    Write-Host "所有下载通道均失败。请手动下载后重试："
-    Write-Host ("  " + $zipUrl)
-    exit 1
-}
-    if (Invoke-Download ($zipUrl + '.sha256') $tmpSha -MinSize 16 -Quiet) {
+    # 通道顺序：① GitHub API 资产端点（校园网/受限网络下 github.com 与各类镜像常被阻断，
+    #   而 api.github.com 通常可达，302 到 CDN 直下、实测最快）② github.com 直连 ③ 加速镜像
+    # 每个通道都逐秒刷新进度（MB / 百分比 / 速度 / 秒数），单通道停滞 60 秒自动换下一个。
+    $octet     = @{ 'Accept' = 'application/octet-stream' }
+    $assetBase = 'https://api.github.com/repos/Misyra/Campus-Auth-rs/releases/assets/'
+    $chans = New-Object System.Collections.ArrayList
+    if ($zipAssetId) { [void]$chans.Add(@{ u = $assetBase + $zipAssetId; h = $octet; t = 'GitHub API 直下' }) }
+    [void]$chans.Add(@{ u = $zipUrl; h = $null; t = 'GitHub 直连' })
+    foreach ($m in @('https://gh-proxy.com/', 'https://ghfast.top/')) { [void]$chans.Add(@{ u = $m + $zipUrl; h = $null; t = ('加速镜像 ' + $m.TrimEnd('/')) }) }
+
+    $dlOk = $false
+    foreach ($c in $chans) {
+        $tag = $c.t
+        Write-Host ("  下载通道: " + $tag)
+        try {
+            Save-UrlWithProgress $c.u $tmpZip $tag 60 $c.h | Out-Null
+            if ((Get-Item $tmpZip).Length -lt 1MB) { throw "文件过小，可能是错误页" }
+            $dlOk = $true
+            break
+        } catch {
+            Write-Host ("  " + $tag + " 失败: " + $_.Exception.Message)
+            Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not $dlOk) {
+        Write-Host "所有下载通道均失败。请手动下载后重试："
+        Write-Host ("  " + $zipUrl)
+        exit 1
+    }
+    $shaGot = $false
+    if ($shaAssetId) {
+        try { Save-UrlWithProgress ($assetBase + $shaAssetId) $tmpSha '校验和' 20 $octet | Out-Null; $shaGot = $true } catch { $shaGot = $false }
+    }
+    if ((-not $shaGot) -and (Invoke-Download ($zipUrl + '.sha256') $tmpSha -MinSize 16 -Quiet)) { $shaGot = $true }
+    if ($shaGot) {
         $expect = ((Get-Content $tmpSha -TotalCount 1) -split '\s+')[0].Trim().ToLower()
         # 上游若未附 .sha256，或镜像返回的是错误页，拿到的都不是 64 位十六进制：
         # 此时「跳过校验」而非「中止安装」，避免上游打包问题挡住正常安装（用户曾遇此坑）
@@ -530,34 +572,52 @@ if (-not (Invoke-Download $zipUrl $tmpZip)) {
                 Write-Host "预置 uv（镜像加速下载，之后后端将跳过 uv 下载环节）..."
                 Write-Host "  uv 约 20 MB，下方进度会持续跳动；秒数在走即为正常，请稍候。"
                 New-Item -ItemType Directory -Path $uvDir -Force | Out-Null
-                $uvVer = $null
-                try {
-                    $uvApi = 'https://gh-proxy.com/https://api.github.com/repos/astral-sh/uv/releases/latest'
-                    $uvVer = (Get-ApiJson $uvApi @{} 20).tag_name
-                } catch {}
+                $uvVer = $null; $uvRel = $null
+                # 版本号：先直连 api.github.com（受限网络下它通常仍可达），失败再走镜像包装
+                foreach ($uvApi in @('https://api.github.com/repos/astral-sh/uv/releases/latest', 'https://gh-proxy.com/https://api.github.com/repos/astral-sh/uv/releases/latest')) {
+                    try { $uvRel = Get-ApiJson $uvApi @{} 20; if ($uvRel -and $uvRel.tag_name) { $uvVer = $uvRel.tag_name; break } } catch {}
+                }
                 if ($uvVer) {
-                    $uvBase = ("https://github.com/astral-sh/uv/releases/download/" + $uvVer + "/uv-x86_64-pc-windows-msvc")
-                    $uvTmp = Join-Path $uvDir 'uv-preset.zip'
-                    $uvOk = $false
-                    # zip 与校验值必须取自同一镜像（同源才保证一致），逐镜像成对下载
-                    foreach ($uvPrefix in @('https://gh-proxy.com/', 'https://ghfast.top/')) {
+                    $uvName = 'uv-x86_64-pc-windows-msvc'
+                    $uvBase = ("https://github.com/astral-sh/uv/releases/download/" + $uvVer + "/" + $uvName)
+                    $uvTmp  = Join-Path $uvDir 'uv-preset.zip'
+                    $uvOk   = $false
+                    # 通道：① API 资产端点直下（zip 与 sha 同源、官方权威）② 直连 ③ 加速镜像；
+                    # zip 与校验值始终取自同一通道（同源才保证一致）
+                    $uvAssetBase = 'https://api.github.com/repos/astral-sh/uv/releases/assets/'
+                    $uvChans = New-Object System.Collections.ArrayList
+                    try {
+                        $uz = $uvRel.assets | Where-Object { $_.name -eq ($uvName + '.zip') } | Select-Object -First 1
+                        $us = $uvRel.assets | Where-Object { $_.name -eq ($uvName + '.zip.sha256') } | Select-Object -First 1
+                        if ($uz) {
+                            $usUrl = if ($us) { $uvAssetBase + $us.id } else { $null }
+                            [void]$uvChans.Add(@{ z = $uvAssetBase + $uz.id; s = $usUrl; h = $octet; t = 'GitHub API 直下' })
+                        }
+                    } catch {}
+                    [void]$uvChans.Add(@{ z = $uvBase + '.zip'; s = $uvBase + '.zip.sha256'; h = $null; t = 'GitHub 直连' })
+                    foreach ($um in @('https://gh-proxy.com/', 'https://ghfast.top/')) {
+                        [void]$uvChans.Add(@{ z = $um + $uvBase + '.zip'; s = $um + $uvBase + '.zip.sha256'; h = $null; t = ('加速镜像 ' + $um.TrimEnd('/')) })
+                    }
+                    foreach ($c in $uvChans) {
+                        Write-Host ("  uv 通道: " + $c.t)
                         try {
-                            Write-Host ("  通道 " + $uvPrefix + " ...")
-                            Save-UrlWithProgress ($uvPrefix + $uvBase + '.zip.sha256') ($uvTmp + '.sha256') '校验文件' 30 | Out-Null
-                            Save-UrlWithProgress ($uvPrefix + $uvBase + '.zip') $uvTmp ('uv ' + $uvVer) 60 | Out-Null
-                            $want = ([IO.File]::ReadAllText($uvTmp + '.sha256').Trim() -split '\s+')[0]
+                            if ($c.s) { Save-UrlWithProgress $c.s ($uvTmp + '.sha256') '校验文件' 30 $c.h | Out-Null }
+                            Save-UrlWithProgress $c.z $uvTmp ('uv ' + $uvVer) 60 $c.h | Out-Null
+                            $want = ''
+                            if (Test-Path ($uvTmp + '.sha256')) { $want = (([IO.File]::ReadAllText($uvTmp + '.sha256')).Trim() -split '\s+')[0].ToLower() }
                             $got = (Get-FileHash -Path $uvTmp -Algorithm SHA256).Hash.ToLower()
-                            if ($got -eq $want) {
+                            if (($want -match '^[0-9a-f]{64}$') -and ($got -ne $want)) {
+                                Write-Host ("  " + $c.t + " 校验不一致，换下一个源...")
+                            } else {
+                                if ((-not ($want -match '^[0-9a-f]{64}$'))) { Write-Host "  未取得有效校验值，跳过校验（不影响安装）" }
                                 $uvX = Join-Path $uvDir ('uv-preset-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
                                 Expand-Archive -Path $uvTmp -DestinationPath $uvX -Force
                                 $found = Get-ChildItem -Path $uvX -Recurse -Filter 'uv.exe' | Select-Object -First 1
                                 if ($found) { Move-Item -Path $found.FullName -Destination $uvExe -Force; $uvOk = $true }
                                 Remove-Item $uvX -Recurse -Force -ErrorAction SilentlyContinue
-                            } else {
-                                Write-Host ("  镜像 " + $uvPrefix + " 校验不一致，换下一个源...")
                             }
                         } catch {
-                            Write-Host ("  镜像 " + $uvPrefix + " 不可用，换下一个源...")
+                            Write-Host ("  " + $c.t + " 不可用: " + $_.Exception.Message)
                         }
                         Remove-Item ($uvTmp + '.sha256') -Force -ErrorAction SilentlyContinue
                         Remove-Item $uvTmp -Force -ErrorAction SilentlyContinue
