@@ -6,7 +6,7 @@
 # - starts the tray app; the web console is never needed
 # ============================================================
 # options via env vars (silent/test runs): CA_INSTALLDIR / CA_USERNAME /
-# CA_PASSWORD / CA_ASSUMEYES / CA_NOLAUNCH
+# CA_PASSWORD / CA_ASSUMEYES / CA_NOLAUNCH / CA_LOG_DIR（日志目录，默认 %TEMP%）
 $DefaultDir = if (Test-Path 'D:\') { 'D:\campus-auth' } else { "$env:LOCALAPPDATA\campus-auth" }
 $InstallDir = if ($env:CA_INSTALLDIR) { $env:CA_INSTALLDIR } else { $DefaultDir }
 $Username   = $env:CA_USERNAME
@@ -33,24 +33,19 @@ try {
 
 # ---------------- 诊断日志：窗口一闪而过 / 报错时，把下面这个文件发回来即可定位 ----------------
 # 必须在任何 exit 之前初始化：早前版本把日志建在提权块之后，导致提权交接一出问题就零证据。
-# 双写：%TEMP% 一份；安装器同目录再镜像一份（提权后若换了账户，TEMP 会变，靠镜像兜底）。
-$LogFile  = Join-Path $env:TEMP 'campus-auth-install.log'
-$LogMirror = $null
-if ($env:CA_SELF) {
-    try {
-        $sd = Split-Path -Parent $env:CA_SELF
-        if ($sd -and (Test-Path $sd)) { $LogMirror = Join-Path $sd 'campus-auth-install.log' }
-    } catch {}
-}
-if ($LogMirror -and ($LogMirror -ieq $LogFile)) { $LogMirror = $null }
+# 只写系统缓存目录（%TEMP%），**不在安装器同目录留任何文件**（同目录通常就是桌面，不该被污染）。
+# 提权后若换了账户（标准用户 + 输入另一个管理员密码），子进程自己的 %TEMP% 会变；
+# 由提权引导码把父进程的 CA_LOG_DIR 传下去，保证父/子进程始终写同一个日志文件。
+$LogDir = $env:TEMP
+if ($env:CA_LOG_DIR) { try { if (Test-Path -LiteralPath $env:CA_LOG_DIR) { $LogDir = $env:CA_LOG_DIR } } catch {} }
+if (-not $LogDir) { $LogDir = $env:TEMP }
+$LogFile        = Join-Path $LogDir 'campus-auth-install.log'
+$TranscriptFile = Join-Path $LogDir 'campus-auth-install-transcript.log'
 # .bat 头自带 pause，无需再等一次；但提权窗口是 powershell 直启（没有 .bat 的 pause），必须自己留住窗口
 $UnderBat = [bool]($env:CA_SELF -and ($env:CA_SELF -match '(?i)\.bat$') -and (-not $env:CA_ELEV_CHILD))
 function Write-Log([string]$msg) {
     $line = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $msg
-    foreach ($f in @($LogFile, $LogMirror)) {
-        if (-not $f) { continue }
-        try { Add-Content -LiteralPath $f -Value $line -Encoding UTF8 } catch {}
-    }
+    try { Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8 } catch {}
 }
 function Wait-ExitKey([string]$tip) {
     if ($AssumeYes -or $UnderBat) { return }
@@ -69,7 +64,7 @@ Write-Log ("时间=" + (Get-Date).ToString('s') + "  PS=" + $PSVersionTable.PSVe
 Write-Log ("系统=" + [Environment]::OSVersion.VersionString + "  64位进程=" + [Environment]::Is64BitProcess)
 Write-Log ("用户=" + $env:USERDOMAIN + "\" + $env:USERNAME + "  管理员=" + $IsAdmin + "  已尝试提权=" + [bool]$env:CA_ELEV_TRIED)
 Write-Log ("自身=" + $env:CA_SELF + "  脚本=" + $MyInvocation.MyCommand.Path + "  TEMP=" + $env:TEMP)
-Write-Log ("日志=" + $LogFile + "  镜像=" + $LogMirror)
+Write-Log ("日志=" + $LogFile + "  CA_LOG_DIR=" + $env:CA_LOG_DIR)
 # 权限环境快照：判断"提权到底有没有可能成功"（不是管理员账户 / UAC 被关 / 被策略禁止提权）
 try {
     $inAdminGrp = $false
@@ -83,7 +78,7 @@ try {
     } catch {}
     Write-Log ('权限环境: 属管理员组(SID544)=' + $inAdminGrp + '  ' + $uacInfo + '  ComSpec=' + $env:ComSpec + '  提权子进程=' + [bool]$env:CA_ELEV_CHILD)
 } catch {}
-try { Start-Transcript -Path (Join-Path $env:TEMP 'campus-auth-install-transcript.log') -Append -ErrorAction Stop | Out-Null; Write-Log 'transcript=on' } catch { Write-Log ('transcript=off: ' + $_.Exception.Message) }
+try { Start-Transcript -Path $TranscriptFile -Append -ErrorAction Stop | Out-Null; Write-Log 'transcript=on' } catch { Write-Log ('transcript=off: ' + $_.Exception.Message) }
 Write-Host ("诊断日志: " + $LogFile)
 
 # ---- 管理员权限：注册「登录 + 唤醒」自启任务需要管理员 ----
@@ -108,6 +103,7 @@ if ((-not $IsAdmin) -and (-not $AssumeYes) -and (-not $env:CA_ELEV_TRIED)) {
                 # 现在直接让提权后的 PowerShell 重新读本文件执行，绕开 cmd 与路径编码。
                 $q  = [char]39   # 单引号
                 $boot = '$env:CA_ELEV_CHILD=' + $q + '1' + $q + '; $env:CA_ELEV_TRIED=' + $q + '1' + $q +
+                        '; $env:CA_LOG_DIR=' + $q + $LogDir + $q +
                         '; $env:CA_SELF=' + $q + $SelfPath + $q +
                         '; iex ([IO.File]::ReadAllText(' + $q + $SelfPath + $q + ',[Text.Encoding]::UTF8) -split (' + $q + '#' + $q + '+' + $q + 'CAMPUSAUTH_PS' + $q + '+' + $q + '#' + $q + '),2)[1]'
                 $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($boot))

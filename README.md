@@ -27,7 +27,7 @@ $env:CA_ASSUMEYES = '1'    # 跳过所有确认
 powershell -ExecutionPolicy Bypass -File campus-auth-onekey-setup.ps1
 ```
 
-其他可选变量：`CA_INSTALLDIR`（安装目录）、`CA_NOLAUNCH`（装完不启动）。
+其他可选变量：`CA_INSTALLDIR`（安装目录）、`CA_NOLAUNCH`（装完不启动）、`CA_LOG_DIR`（诊断日志目录，默认 `%TEMP%`）。
 
 ---
 
@@ -66,7 +66,7 @@ powershell -ExecutionPolicy Bypass -File campus-auth-onekey-setup.ps1
 
 别反复点，按顺序做，基本都能定位：
 
-**1) 先量文件大小。** 右键安装器 →「属性」→ 常规 →「大小」，应和发送方手上原文件的字节数**完全一致**（当前版本 70,106 字节 / 68.5 KB，SHA256 `2a99cc6c…f4a44b`）。
+**1) 先量文件大小。** 右键安装器 →「属性」→ 常规 →「大小」，应和发送方手上原文件的字节数**完全一致**（当前版本 70,316 字节 / 68.7 KB，SHA256 `ee7eb0be…e476d0`）。
 数字不对（0 字节、几十 KB 等）说明**文件在传输中被改动或截断**（微信 / QQ / 网盘 / 压缩工具都可能），让对方重发一次即可。
 
 > 注意：微信/QQ 收到同名文件会自动改名成 `xxx(1).bat`、`xxx(2).bat`，**这是正常的，不影响运行**。
@@ -75,9 +75,12 @@ powershell -ExecutionPolicy Bypass -File campus-auth-onekey-setup.ps1
 
 | 位置 | 文件 | 说明 |
 | --- | --- | --- |
-| 安装器**同目录** | `campus-auth-install.log` | **首选看这个**。完整诊断日志：系统版本、是否管理员、是否属管理员组、UAC 开关、是否发起过提权、子进程 PID 与退出码、出错行号 |
-| `%TEMP%`（地址栏粘 `%TEMP%` 回车） | `campus-auth-install.log` | 同上内容（双写备份）。提权换了账户时 TEMP 会变，此时只有同目录那份最准 |
+| `%TEMP%` | `campus-auth-install.log` | **首选看这个**。完整诊断日志：系统版本、是否管理员、是否属管理员组、UAC 开关、是否发起过提权、子进程 PID 与退出码、出错行号 |
+| `%TEMP%` | `campus-auth-install-transcript.log` | 安装全过程实录（含下载进度逐行输出） |
 | `%TEMP%` | `campus-auth-bat-started.txt` | **没有它 = 安装器根本没被执行**（被安全软件/系统策略拦下，或文件本身损坏）；有它则记着 PowerShell 的退出码 |
+
+> 日志**只写系统缓存目录**（`%TEMP%`），不会在安装器旁边生成任何文件——桌面保持干净。
+> 提权后即使换了账户，子进程也会跟着父进程写同一份日志。
 
 **怎么看日志判断卡在哪：**
 
@@ -109,7 +112,7 @@ python build_onekey.py
 | 文件 | 作用 |
 | --- | --- |
 | `build_onekey.py` | 构建脚本：模板 + 预设配置 → 独立安装器 |
-| `onekey-template.ps1.tpl` | 安装器模板：解析最新 Release、多通道下载（API 直下 / 直连 / gh-proxy 镜像，带进度与停滞换源）、下载 uv 预置、写配置、注册自启动、启动托盘；UAC 提权交接（`-EncodedCommand` 纯 ASCII 引导码，绕开 cmd 与中文/括号路径编码问题 + 等待子窗口 + 秒退自愈 + 权限环境留痕）、诊断日志双写 |
+| `onekey-template.ps1.tpl` | 安装器模板：解析最新 Release、多通道下载（API 直下 / 直连 / gh-proxy 镜像，带进度与停滞换源）、下载 uv 预置、写配置、注册自启动、启动托盘；UAC 提权交接（`-EncodedCommand` 纯 ASCII 引导码，绕开 cmd 与中文/括号路径编码问题 + 等待子窗口 + 秒退自愈 + 权限环境留痕）、诊断日志（只写 `%TEMP%`，提权子进程沿用父进程日志目录，不在安装器旁边留文件） |
 | `preset-settings.json` | 真实运行的设置快照，让重建不依赖已安装目录 |
 | `campus-auth-default-fixed.json` | 默认认证任务，账号/密码用 `{{USERNAME}}`/`{{PASSWORD}}` 占位符 |
 
