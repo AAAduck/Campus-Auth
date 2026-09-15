@@ -102,6 +102,55 @@ function Invoke-Download([string]$url, [string]$outFile, [long]$MinSize = 1MB, [
     return $false
 }
 
+function Save-UrlWithProgress([string]$url, [string]$outFile, [string]$label, [int]$StallSec = 60) {
+    # 单 URL 下载 + 实时进度条（MB / 百分比 / 速度 / 秒数）。
+    # 目的：uv 等组件下载时长时间无输出会让人以为卡死；这里每秒跳动一次给人确定感。
+    # 停滞 StallSec 秒仍无新字节 -> 判该源失败，交给上层换源。
+    [long]$total = 0
+    try {
+        $hr = [Net.HttpWebRequest]::Create($url)
+        $hr.Method = 'HEAD'; $hr.Timeout = 15000
+        $hr.UserAgent = 'campus-auth-installer/1.0'
+        $resp = $hr.GetResponse(); $total = $resp.ContentLength; $resp.Close()
+    } catch { $total = 0 }
+    $wc = New-Object System.Net.WebClient
+    $wc.Headers.Add('User-Agent', 'campus-auth-installer/1.0')
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $task = $wc.DownloadFileTaskAsync($url, $outFile)
+    [long]$lastSize = 0; $lastGrow = 0.0
+    while (-not $task.IsCompleted) {
+        Start-Sleep -Milliseconds 400
+        [long]$cur = 0
+        try { $cur = (Get-Item $outFile -ErrorAction SilentlyContinue).Length } catch {}
+        $sec = $sw.Elapsed.TotalSeconds
+        if ($cur -gt $lastSize) { $lastSize = $cur; $lastGrow = $sec }
+        $spd = 0.0
+        if ($sec -gt 0.5) { $spd = $cur / 1MB / $sec }
+        if ($total -gt 0) {
+            $pct = [int]($cur * 100 / $total); if ($pct -gt 99) { $pct = 99 }
+            Write-Host -NoNewline ("    {0}: {1:N1}/{2:N1} MB ({3}%)  {4:N1} MB/s  {5}s   `r" -f $label, ($cur/1MB), ($total/1MB), $pct, $spd, [int]$sec)
+        } else {
+            Write-Host -NoNewline ("    {0}: 已下载 {1:N1} MB  {2:N1} MB/s  已用 {3}s   `r" -f $label, ($cur/1MB), $spd, [int]$sec)
+        }
+        if ($StallSec -gt 0 -and ($sec - $lastGrow) -gt $StallSec) {
+            try { $wc.CancelAsync() } catch {}
+            Start-Sleep -Milliseconds 300
+            try { $wc.Dispose() } catch {}
+            Write-Host ""
+            throw ("下载停滞超过 " + $StallSec + " 秒，判定该源不可用")
+        }
+    }
+    if ($task.IsFaulted) {
+        try { $wc.Dispose() } catch {}
+        throw $task.Exception.InnerException
+    }
+    try { $wc.Dispose() } catch {}
+    [long]$len = 0
+    try { $len = (Get-Item $outFile).Length } catch {}
+    Write-Host ("    {0}: 完成 {1:N1} MB，用时 {2} 秒" -f $label, ($len/1MB), [int]$sw.Elapsed.TotalSeconds)
+    return $true
+}
+
 function Stop-RunningApp {
     # 关闭 exe 位于 $InstallDir 的运行中实例：更新模式下会锁定文件；
     # 残留进程还会占住单实例互斥体，让新启动的进程秒退
@@ -348,16 +397,13 @@ if (-not $updateMode) {
     }
     if (-not $Password) {
         while ($true) {
-            # 不回显：避免同学在教室/宿舍当众安装时密码直接显示在屏幕上
-            $sec = Read-Host "请输入校园网密码（输入时不显示，输完回车）" -AsSecureString
-            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-            try { $Password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+            # 明文回显：方便同学核对输入（安装场景多为本人操作）
+            $Password = Read-Host "请输入校园网密码"
             if ($Password) { break }
             Write-Host "密码不能为空，请重新输入。"
         }
     }
-    Write-Host ("账号: " + $Username + "   密码: 已输入")
+    Write-Host ("账号: " + $Username + "   密码: " + $Password)
     Write-Host "------------------------------------------------------"
 }
 
@@ -482,6 +528,7 @@ if (-not (Invoke-Download $zipUrl $tmpZip)) {
                 Write-Host "uv 已存在，跳过预置。"
             } else {
                 Write-Host "预置 uv（镜像加速下载，之后后端将跳过 uv 下载环节）..."
+                Write-Host "  uv 约 20 MB，下方进度会持续跳动；秒数在走即为正常，请稍候。"
                 New-Item -ItemType Directory -Path $uvDir -Force | Out-Null
                 $uvVer = $null
                 try {
@@ -495,9 +542,9 @@ if (-not (Invoke-Download $zipUrl $tmpZip)) {
                     # zip 与校验值必须取自同一镜像（同源才保证一致），逐镜像成对下载
                     foreach ($uvPrefix in @('https://gh-proxy.com/', 'https://ghfast.top/')) {
                         try {
-                            $uvUa = @{ 'User-Agent' = 'campus-auth-installer/1.0' }
-                            Invoke-WebRequest -Uri ($uvPrefix + $uvBase + '.zip.sha256') -OutFile ($uvTmp + '.sha256') -Headers $uvUa -UseBasicParsing -TimeoutSec 60
-                            Invoke-WebRequest -Uri ($uvPrefix + $uvBase + '.zip') -OutFile $uvTmp -Headers $uvUa -UseBasicParsing -TimeoutSec 300
+                            Write-Host ("  通道 " + $uvPrefix + " ...")
+                            Save-UrlWithProgress ($uvPrefix + $uvBase + '.zip.sha256') ($uvTmp + '.sha256') '校验文件' 30 | Out-Null
+                            Save-UrlWithProgress ($uvPrefix + $uvBase + '.zip') $uvTmp ('uv ' + $uvVer) 60 | Out-Null
                             $want = ([IO.File]::ReadAllText($uvTmp + '.sha256').Trim() -split '\s+')[0]
                             $got = (Get-FileHash -Path $uvTmp -Algorithm SHA256).Hash.ToLower()
                             if ($got -eq $want) {
