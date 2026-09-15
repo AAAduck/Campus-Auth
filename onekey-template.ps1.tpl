@@ -32,12 +32,13 @@ $IsAdmin = $false
 try {
     $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 } catch { $IsAdmin = $false }
-if ((-not $IsAdmin) -and (-not $AssumeYes)) {
+if ((-not $IsAdmin) -and (-not $AssumeYes) -and (-not $env:CA_ELEV_TRIED)) {
     $SelfPath = $env:CA_SELF
     if (-not $SelfPath) { try { $SelfPath = $MyInvocation.MyCommand.Path } catch {} }
     if ($SelfPath -and (Test-Path $SelfPath)) {
         Write-Host "本安装器需要管理员权限（用于注册开机/唤醒自启任务）。正在请求提权，请在弹窗中点「是」..."
         try {
+            $env:CA_ELEV_TRIED = '1'   # 只提权一次，避免提权后仍非管理员时无限弹窗刷屏
             if ($SelfPath -match '\.ps1$') {
                 Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $SelfPath + '"'))
             } else {
@@ -53,6 +54,32 @@ if ((-not $IsAdmin) -and (-not $AssumeYes)) {
         Write-Host "提示：当前非管理员，仅启用登录自启（无唤醒自启）。如需唤醒自启，请以管理员身份运行本安装器。"
     }
 }
+
+# ---------------- 诊断日志：窗口一闪而过 / 报错时，把下面这个文件发回来即可定位 ----------------
+$LogFile  = Join-Path $env:TEMP 'campus-auth-install.log'
+$UnderBat = [bool]($env:CA_SELF -and ($env:CA_SELF -match '(?i)\.bat$'))   # .bat 头自带 pause，无需再等一次
+function Write-Log([string]$msg) {
+    try { Add-Content -LiteralPath $LogFile -Value ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $msg) -Encoding UTF8 } catch {}
+}
+function Wait-ExitKey([string]$tip) {
+    if ($AssumeYes -or $UnderBat) { return }
+    try { Write-Host ""; Read-Host ("按回车键关闭窗口（" + $tip + "）") | Out-Null } catch {}
+}
+function Die([string]$msg) {
+    Write-Host ""
+    Write-Host $msg
+    Write-Log ("安装中止: " + $msg)
+    Write-Host ("诊断日志: " + $LogFile)
+    Wait-ExitKey '安装未完成'
+    exit 1
+}
+Write-Log "================ 安装器启动 ================"
+Write-Log ("时间=" + (Get-Date).ToString('s') + "  PS=" + $PSVersionTable.PSVersion.ToString() + "  语言模式=" + $ExecutionContext.SessionState.LanguageMode)
+Write-Log ("系统=" + [Environment]::OSVersion.VersionString + "  64位进程=" + [Environment]::Is64BitProcess)
+Write-Log ("用户=" + $env:USERDOMAIN + "\" + $env:USERNAME + "  管理员=" + $IsAdmin)
+Write-Log ("自身=" + $env:CA_SELF + "  脚本=" + $MyInvocation.MyCommand.Path + "  TEMP=" + $env:TEMP)
+try { Start-Transcript -Path (Join-Path $env:TEMP 'campus-auth-install-transcript.log') -Append -ErrorAction Stop | Out-Null; Write-Log 'transcript=on' } catch { Write-Log ('transcript=off: ' + $_.Exception.Message) }
+Write-Host ("诊断日志: " + $LogFile)
 
 function Read-Choice([string]$msg) {
     if ($AssumeYes) { return $true }
@@ -383,6 +410,9 @@ function Invoke-EnvBootstrap([string]$apiBase) {
     try { return ($out | ConvertFrom-Json) } catch { return $null }
 }
 
+# ==================== 主流程（整体兜底） ====================
+# 任何未预期的错误都会被捕获 -> 写入诊断日志 + 把窗口留住，避免"一闪而过、啥也看不到"
+try {
 Write-Host "================ campus-auth 一键安装 ================"
 Write-Host ("安装目录: " + $InstallDir)
 
@@ -390,9 +420,9 @@ Write-Host ("安装目录: " + $InstallDir)
 $updateMode = Test-Path (Join-Path $InstallDir 'campus-auth.exe')
 if ($updateMode) {
     Write-Host "检测到已安装 -> 更新模式（保留账号配置与任务，仅更新程序）"
-    if (-not (Read-Choice '继续更新?')) { Write-Host "已取消。"; exit 0 }
+    if (-not (Read-Choice '继续更新?')) { Write-Host "已取消。"; Write-Log "用户取消（更新）"; Wait-ExitKey '已取消'; exit 0 }
 } else {
-    if (-not (Read-Choice '开始全新安装?')) { Write-Host "已取消。"; exit 0 }
+    if (-not (Read-Choice '开始全新安装?')) { Write-Host "已取消。"; Write-Log "用户取消（安装）"; Wait-ExitKey '已取消'; exit 0 }
 }
 
 # ---- credentials (fresh install only; terminal input, no web console) ----
@@ -461,7 +491,7 @@ try {
     if (-not $dlOk) {
         Write-Host "所有下载通道均失败。请手动下载后重试："
         Write-Host ("  " + $zipUrl)
-        exit 1
+        Die "下载失败：所有下载通道均不可用（网络受限/被拦截）。"
     }
     $shaGot = $false
     if ($shaAssetId) {
@@ -474,7 +504,7 @@ try {
         # 此时「跳过校验」而非「中止安装」，避免上游打包问题挡住正常安装（用户曾遇此坑）
         if ($expect -match '^[0-9a-f]{64}$') {
             $actual = (Get-FileHash $tmpZip -Algorithm SHA256).Hash.ToLower()
-            if ($expect -ne $actual) { Write-Host "SHA256 校验失败（下载文件与官方校验值不符），安装中止。"; exit 1 }
+            if ($expect -ne $actual) { Die "SHA256 校验失败（下载文件与官方校验值不符），安装中止。" }
             Write-Host "SHA256 校验通过"
         } else {
             Write-Host "未取得有效 SHA256 校验值，跳过校验（不影响安装）"
@@ -728,3 +758,19 @@ try {
     Remove-Item $tmpZip, $tmpSha -Force -ErrorAction SilentlyContinue
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
 }
+} catch {
+    $em = $_.Exception.Message
+    Write-Log "==== 未捕获异常 ===="
+    try { Write-Log ($_ | Out-String) } catch {}
+    if ($_.InvocationInfo) { Write-Log ("位置: 第 " + $_.InvocationInfo.ScriptLineNumber + " 行") }
+    Write-Host ""
+    Write-Host ("安装过程中出现未预期的错误: " + $em)
+    if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) { Write-Host ("  出错位置: 第 " + $_.InvocationInfo.ScriptLineNumber + " 行") }
+    Write-Host "可能原因：杀毒/安全软件拦截、系统脚本策略受限、网络被阻断、文件在传输中损坏。"
+    Write-Host ("诊断日志（请把这个文件发回来）: " + $LogFile)
+    Wait-ExitKey '出错了'
+    exit 1
+}
+# 正常走完（直接双击 .ps1 时窗口不会一闪而过）
+Write-Log "================ 安装器结束 ================"
+Wait-ExitKey '安装流程结束'
