@@ -134,4 +134,8 @@ python build_onekey.py
 
 ## 许可证
 
-安装器构建脚本以 MIT 许可证分发；本体程序版权与许可证归上游 `Misyra/Campus-Auth-rs` 所有。
+本仓库（安装器构建脚本、模板与预设配置）以 **MIT 许可证**分发，见 [LICENSE](LICENSE)。
+
+本体程序版权与许可证归上游 [Misyra/Campus-Auth-rs](https://github.com/Misyra/Campus-Auth-rs) 所有，上游采用 **AGPL-3.0**。
+
+本仓库**不重新分发**上游二进制：安装器在运行时从上游 GitHub Release 下载本体，因此本仓库不属于上游作品的再分发；若你二次分发上游程序本体，请自行遵守 AGPL-3.0。
